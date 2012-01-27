@@ -5,7 +5,10 @@ import sys
 from mock import patch
 
 from django.test import TestCase
-from django.utils import unittest
+try:
+    from django.utils import unittest
+except ImportError:
+    import unittest2 as unittest
 
 from pipeline.conf import settings
 from pipeline.compressors import Compressor
