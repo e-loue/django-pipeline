@@ -1,54 +1,74 @@
-import errno
 import os
 
-from datetime import datetime
-
 try:
-    from django.contrib.staticfiles import finders
-except ImportError:
     from staticfiles import finders
+    from staticfiles.storage import CachedFilesMixin, StaticFilesStorage
+except ImportError:
+    from django.contrib.staticfiles import finders # noqa
+    from django.contrib.staticfiles.storage import CachedFilesMixin, StaticFilesStorage # noqa
 
 from django.core.exceptions import ImproperlyConfigured
-from django.core.files.storage import FileSystemStorage, get_storage_class
+from django.core.files.storage import get_storage_class
 from django.utils.functional import LazyObject
 
 from pipeline.conf import settings
 
 
-class PipelineStorage(FileSystemStorage):
-    def __init__(self, location=None, base_url=None, *args, **kwargs):
-        if location is None:
-            location = settings.PIPELINE_ROOT
-        if base_url is None:
-            base_url = settings.PIPELINE_URL
-        super(PipelineStorage, self).__init__(location, base_url, *args, **kwargs)
+class PipelineMixin(object):
+    packing = True
 
-    def accessed_time(self, name):
-        return datetime.fromtimestamp(os.path.getatime(self.path(name)))
+    def post_process(self, paths, dry_run=False, **options):
+        if dry_run:
+            return []
 
-    def created_time(self, name):
-        return datetime.fromtimestamp(os.path.getctime(self.path(name)))
+        from pipeline.packager import Packager
+        packager = Packager(storage=self)
+        for package_name in packager.packages['css']:
+            package = packager.package_for('css', package_name)
+            output_file = package.output_filename
+            if self.packing:
+                packager.pack_stylesheets(package)
+            paths[output_file] = (self, output_file)
+        for package_name in packager.packages['js']:
+            package = packager.package_for('js', package_name)
+            output_file = package.output_filename
+            if self.packing:
+                packager.pack_javascripts(package)
+            paths[output_file] = (self, output_file)
 
-    def modified_time(self, name):
-        return datetime.fromtimestamp(os.path.getmtime(self.path(name)))
+        super_class = super(PipelineMixin, self)
+        if hasattr(super_class, 'post_process'):
+            return super_class.post_process(paths, dry_run, **options)
+
+        return [
+            (path, path, True)
+            for path in paths
+        ]
 
     def get_available_name(self, name):
         if self.exists(name):
             self.delete(name)
         return name
 
-    def _open(self, name, mode='rb'):
-        full_path = self.path(name)
-        directory = os.path.dirname(full_path)
-        if not os.path.exists(directory):
-            try:
-                os.makedirs(directory)
-            except OSError, e:
-                if e.errno != errno.EEXIST:
-                    raise
-        if not os.path.isdir(directory):
-            raise IOError("%s exists and is not a directory." % directory)
-        return super(PipelineStorage, self)._open(name, mode)
+
+class NonPackagingMixin(object):
+    packing = False
+
+
+class PipelineStorage(PipelineMixin, StaticFilesStorage):
+    pass
+
+
+class NonPackagingPipelineStorage(NonPackagingMixin, PipelineStorage):
+    pass
+
+
+class PipelineCachedStorage(PipelineMixin, CachedFilesMixin, StaticFilesStorage):
+    pass
+
+
+class NonPackagingPipelineCachedStorage(NonPackagingMixin, PipelineCachedStorage):
+    pass
 
 
 class BaseFinderStorage(PipelineStorage):
@@ -70,8 +90,36 @@ class BaseFinderStorage(PipelineStorage):
     def exists(self, name):
         exists = self.finders.find(name) != None
         if not exists:
-            exists = super(BaseFinderStorage, self).exists(name)
+            return super(BaseFinderStorage, self).exists(name)
         return exists
+
+    def listdir(self, path):
+        for finder in finders.get_finders():
+            for storage in finder.storages.values():
+                try:
+                    return storage.listdir(path)
+                except OSError:
+                    pass
+
+    def find_storage(self, name):
+        for finder in finders.get_finders():
+            for path, storage in finder.list([]):
+                if path == name:
+                    return storage
+                if os.path.splitext(path)[0] == os.path.splitext(name)[0]:
+                    return storage
+        raise ValueError("The file '%s' could not be found with %r." % (name, self))
+
+    def _open(self, name, mode="rb"):
+        storage = self.find_storage(name)
+        return storage._open(name, mode)
+
+    def _save(self, name, content):
+        storage = self.find_storage(name)
+        # Ensure we overwrite file, since we have no control on external storage
+        if storage.exists(name):
+            storage.delete(name)
+        return storage._save(name, content)
 
 
 class PipelineFinderStorage(BaseFinderStorage):
@@ -83,4 +131,4 @@ class DefaultStorage(LazyObject):
         self._wrapped = get_storage_class(settings.PIPELINE_STORAGE)()
 
 
-storage = DefaultStorage()
+default_storage = DefaultStorage()
